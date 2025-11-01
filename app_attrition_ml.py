@@ -1,22 +1,21 @@
 # app_attrition_ml.py
 # ---------------------------------
-# Streamlit app that:
-#  1) Reads a default CSV (/mnt/data/flight_risk_input_sample.csv)
-#  2) Lets you upload a new CSV
-#  3) Select target and feature columns
-#  4) Trains XGBoost model, shows metrics, and provides downloads
-#  5) Displays Low/Medium/High risk bands bar chart
+# CSV or Oracle DB → Train XGBoost → Predict → Download CSV and/or Write back to DB (with buttons)
 #
 # Usage:
 #   streamlit run app_attrition_ml.py --server.address=0.0.0.0 --server.port=8501
 #
 # Requirements:
 #   pip install streamlit xgboost scikit-learn pandas numpy
+#   # For DB mode:
+#   pip install sqlalchemy cx_Oracle
 
 from __future__ import annotations
 import io
 import os
 import json
+import uuid
+from datetime import datetime, date
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -24,12 +23,20 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, confusion_matrix, classification_report
 from xgboost import XGBClassifier
 
+# Optional DB libs (only used if Database selected)
+try:
+    import cx_Oracle
+    from sqlalchemy import create_engine
+except Exception:
+    cx_Oracle = None
+    create_engine = None
+
 DEFAULT_PATH = "/mnt/data/flight_risk_input_sample.csv"
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
 st.set_page_config(page_title="Flight Risk XGBoost", page_icon="✈️", layout="wide")
-st.title("✈️ Employee Flight Risk — XGBoost (CSV → CSV)")
+st.title("✈️ Employee Flight Risk — XGBoost (CSV / Database)")
 
 # -----------------------------
 # Helpers
@@ -50,28 +57,93 @@ def detect_target_candidates(df: pd.DataFrame) -> list[str]:
     candidates = ["flight_risk", "attrition", "left", "active_flag", "target", "churn", "label"]
     return [c for c in candidates if c in df.columns]
 
+def synthesize_target_if_missing(df: pd.DataFrame, seed: int = RANDOM_STATE) -> tuple[pd.DataFrame, str]:
+    tmp = df.copy()
+    z = 0
+    if "engagement_score" in tmp.columns:
+        z += -0.03 * tmp["engagement_score"].fillna(tmp["engagement_score"].median())
+    if "work_life_balance" in tmp.columns:
+        z += -0.35 * pd.to_numeric(tmp["work_life_balance"], errors="coerce").fillna(3)
+    if "performance_rating" in tmp.columns:
+        z += -0.25 * pd.to_numeric(tmp["performance_rating"], errors="coerce").fillna(3)
+    if "overtime_hours" in tmp.columns:
+        z += 0.06 * pd.to_numeric(tmp["overtime_hours"], errors="coerce").fillna(0)
+    p = 1 / (1 + np.exp(-pd.to_numeric(z)))
+    rnd = np.random.default_rng(seed)
+    df["__synthetic_target__"] = (rnd.random(len(tmp)) < p).astype(int)
+    return df, "__synthetic_target__"
+
+def get_oracle_engine(user: str, password: str, host: str, port: str, sid: str):
+    if cx_Oracle is None or create_engine is None:
+        raise RuntimeError("cx_Oracle / SQLAlchemy not installed. Run: pip install sqlalchemy cx_Oracle")
+    dsn = cx_Oracle.makedsn(host, int(port), sid=sid)
+    engine = create_engine(f"oracle+cx_oracle://{user}:{password}@{dsn}")
+    return engine
+
 # -----------------------------
-# Data input
+# Sidebar — Data source
 # -----------------------------
 with st.sidebar:
     st.header("Data Source")
-    st.caption("By default the app reads /mnt/data/flight_risk_input_sample.csv if available.")
-    uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
+    data_source = st.radio("Choose source", ["CSV", "Database"], horizontal=True)
 
-if uploaded is not None:
-    try:
-        df = pd.read_csv(uploaded)
-        st.success("Using uploaded CSV.")
-    except Exception as e:
-        st.error(f"Failed to read uploaded CSV: {e}")
-        st.stop()
-else:
-    df = load_default_df()
-    if df is None:
-        st.error("No uploaded file and default file not found at /mnt/data/flight_risk_input_sample.csv.")
-        st.stop()
+    uploaded = None
+    db_params = {}
+    connect_clicked = False
+
+    if data_source == "CSV":
+        st.caption("Default: /mnt/data/flight_risk_input_sample.csv")
+        uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
     else:
-        st.info(f"Loaded default file: {DEFAULT_PATH}")
+        st.markdown('<h2 class="section-header">🔌 Database Connection</h2>', unsafe_allow_html=True)
+        with st.form("db_connection_form"):
+            st.write("Enter your Oracle database connection details:")
+            user = st.text_input("Username", value="csv_one_hd100")
+            password = st.text_input("Password", value="csv_one_hd100", type="password")
+            host = st.text_input("Host", value="192.168.4.23")
+            port = st.text_input("Port", value="1521")
+            sid = st.text_input("SID", value="19cdev")
+            source_table = st.text_input("Source table (read)", value="HR_EMPLOYEES")
+            output_table = st.text_input("Output table (write predictions to)", value="HR_EMP_FLIGHT_RISK_PRED")
+            write_mode = st.selectbox("Write mode", ["replace", "append"], index=0,
+                                      help="replace = drop/create table; append = insert rows")
+            connect_button = st.form_submit_button("🔄 Connect & Load Data")
+        db_params = dict(user=user, password=password, host=host, port=port, sid=sid,
+                         source_table=source_table, output_table=output_table, write_mode=write_mode)
+        connect_clicked = connect_button
+
+# -----------------------------
+# Load data
+# -----------------------------
+engine = None
+if data_source == "CSV":
+    if uploaded is not None:
+        try:
+            df = pd.read_csv(uploaded)
+            st.success("Using uploaded CSV.")
+        except Exception as e:
+            st.error(f"Failed to read uploaded CSV: {e}")
+            st.stop()
+    else:
+        df = load_default_df()
+        if df is None:
+            st.error("No uploaded file and default file not found at /mnt/data/flight_risk_input_sample.csv.")
+            st.stop()
+        else:
+            st.info(f"Loaded default file: {DEFAULT_PATH}")
+else:
+    # Database flow: only load when user clicks button
+    if not connect_clicked:
+        st.info("Fill DB details and click **Connect & Load Data** to load from the database.")
+        st.stop()
+    try:
+        engine = get_oracle_engine(db_params["user"], db_params["password"], db_params["host"], db_params["port"], db_params["sid"])
+        with engine.connect() as conn:
+            df = pd.read_sql(f'SELECT * FROM {db_params["source_table"]}', conn)
+        st.success(f"Connected and loaded data from {db_params['source_table']}.")
+    except Exception as e:
+        st.error(f"DB connection/read failed: {e}")
+        st.stop()
 
 # ---------------------------------
 # Column selection
@@ -115,26 +187,24 @@ if target_col is None and not synth_ok:
 
 # Synthesize target if missing
 if target_col is None:
-    tmp = df.copy()
-    z = 0
-    if "engagement_score" in tmp.columns:
-        z += -0.03 * tmp["engagement_score"].fillna(tmp["engagement_score"].median())
-    if "work_life_balance" in tmp.columns:
-        z += -0.35 * pd.to_numeric(tmp["work_life_balance"], errors="coerce").fillna(3)
-    if "performance_rating" in tmp.columns:
-        z += -0.25 * pd.to_numeric(tmp["performance_rating"], errors="coerce").fillna(3)
-    if "overtime_hours" in tmp.columns:
-        z += 0.06 * pd.to_numeric(tmp["overtime_hours"], errors="coerce").fillna(0)
-    p = 1 / (1 + np.exp(-pd.to_numeric(z)))
-    rnd = np.random.default_rng(RANDOM_STATE)
-    df["__synthetic_target__"] = (rnd.random(len(tmp)) < p).astype(int)
-    target_col = "__synthetic_target__"
+    df, target_col = synthesize_target_if_missing(df, seed=RANDOM_STATE)
 
 # ---------------------------------
 # Train & Predict
 # ---------------------------------
 st.subheader("② Train model and generate predictions")
 start = st.button("🚀 Start Model (Train & Predict)")
+
+# Will store predictions in session so the DB write button can use them
+if "out_df" not in st.session_state:
+    st.session_state.out_df = None
+if "feature_space" not in st.session_state:
+    st.session_state.feature_space = None
+if "engine" not in st.session_state:
+    st.session_state.engine = None
+if engine is not None:
+    st.session_state.engine = engine
+st.session_state.db_params = db_params if data_source == "Database" else {}
 
 if start:
     X_all = df[feature_cols].copy()
@@ -187,6 +257,7 @@ if start:
     st.dataframe(pd.DataFrame(cm, index=["Actual 0","Actual 1"], columns=["Pred 0","Pred 1"]))
     st.expander("Classification report").text(classification_report(y_test, preds_test))
 
+    # Full predictions
     full_enc = pd.get_dummies(X_all, columns=categorical_cols, drop_first=False)
     full_enc = full_enc.reindex(columns=feature_space, fill_value=0)
     full_proba = model.predict_proba(full_enc)[:, 1]
@@ -216,7 +287,7 @@ if start:
     })
     st.bar_chart(pd.DataFrame({"count": band_counts}).rename_axis("risk_band"))
 
-    # ---- Download predictions ----
+    # ---- Downloads ----
     st.subheader("④ Download output CSV")
     st.dataframe(out_df.head(50), use_container_width=True)
     st.download_button(
@@ -225,6 +296,10 @@ if start:
         file_name="flight_risk_predictions.csv",
         mime="text/csv",
     )
+
+    # Save to session for DB write button
+    st.session_state.out_df = out_df
+    st.session_state.feature_space = feature_space
 
     # ---- Download model & features ----
     col_m1, col_m2 = st.columns(2)
@@ -250,4 +325,43 @@ if start:
             mime="application/octet-stream",
         )
 
-st.caption("Tip: Upload a new file from the sidebar or rely on the default CSV in /mnt/data.")
+# ---------------------------------
+# DB Write Button (runs only in DB mode and after predictions exist)
+# ---------------------------------
+if data_source == "Database":
+    st.subheader("⑤ Database Actions")
+    if st.session_state.out_df is None:
+        st.info("Run the model first to generate predictions, then you can write them to the database.")
+    else:
+        write_db = st.button("💾 Write predictions to database")
+        if write_db:
+            if st.session_state.engine is None:
+                st.error("No database connection available. Please connect & load data from the sidebar first.")
+            else:
+                try:
+                    process_id = str(uuid.uuid4())
+                    run_date = date.today()
+                    run_time = datetime.now().strftime("%H:%M:%S")
+
+                    out_db = st.session_state.out_df.copy()
+                    out_db["process_id"] = process_id
+                    out_db["prediction_run_date"] = run_date
+                    out_db["prediction_run_time"] = run_time
+
+                    with st.session_state.engine.begin() as conn:
+                        out_db.to_sql(
+                            st.session_state.db_params.get("output_table", "HR_EMP_FLIGHT_RISK_PRED"),
+                            con=conn,
+                            if_exists=st.session_state.db_params.get("write_mode", "replace"),
+                            index=False,
+                            chunksize=1000,
+                            method="multi",
+                        )
+                    st.success(
+                        f"Predictions written to {st.session_state.db_params.get('output_table')} "
+                        f"(process_id={process_id}, date={run_date}, time={run_time})."
+                    )
+                except Exception as e:
+                    st.error(f"Failed to write predictions to DB: {e}")
+
+st.caption("Tip: Choose CSV or Database in the sidebar. In DB mode, click “Connect & Load Data”, run the model, then use “💾 Write predictions to database”.")
