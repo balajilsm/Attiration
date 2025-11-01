@@ -84,7 +84,7 @@ def make_ohe() -> OneHotEncoder:
 def build_preprocessor(df: pd.DataFrame, target_col: str, feature_cols: List[str]) -> Tuple[ColumnTransformer, List[str], List[str]]:
     X = df[feature_cols].copy()
     numeric_cols = [c for c in feature_cols if is_numeric_dtype(X[c])]
-categorical_cols = [c for c in feature_cols if c not in numeric_cols]
+    categorical_cols = [c for c in feature_cols if c not in numeric_cols]
 
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
