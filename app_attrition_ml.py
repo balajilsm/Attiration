@@ -260,4 +260,70 @@ if start:
             mime="application/octet-stream",
         )
 
+out_df = df.copy()
+out_df["flight_risk_prob"] = full_proba
+out_df["flight_risk_pred"] = full_pred
+
+
+# ---- Risk bands summary (Low <80%, Medium 80-90%, High >90%) ----
+out_df["flight_risk_pct"] = (out_df["flight_risk_prob"] * 100.0)
+out_df["risk_band"] = pd.cut(
+out_df["flight_risk_pct"],
+bins=[-np.inf, 80, 90, np.inf],
+labels=["Low (<80%)", "Medium (80–90%)", "High (>90%)"],
+right=True,
+)
+
+
+band_counts = out_df["risk_band"].value_counts().reindex(["Low (<80%)", "Medium (80–90%)", "High (>90%)"]).fillna(0).astype(int)
+
+
+st.subheader("④ Risk bands — counts")
+st.write({
+"Low (<80%)": int(band_counts.get("Low (<80%)", 0)),
+"Medium (80–90%)": int(band_counts.get("Medium (80–90%)", 0)),
+"High (>90%)": int(band_counts.get("High (>90%)", 0)),
+})
+
+
+st.bar_chart(pd.DataFrame({"count": band_counts}).rename_axis("risk_band"))
+
+
+st.subheader("③ Download output CSV")
+st.dataframe(out_df.head(50), use_container_width=True)
+
+
+st.download_button(
+"⬇️ Download predictions CSV",
+data=bytes_from_df_csv(out_df),
+file_name="flight_risk_predictions.csv",
+mime="text/csv",
+)
+
+
+# Optional: offer model + features downloads
+col_m1, col_m2 = st.columns(2)
+with col_m1:
+st.download_button(
+"⬇️ Download feature columns (JSON)",
+data=json.dumps(feature_space, indent=2).encode("utf-8"),
+file_name="feature_columns.json",
+mime="application/json",
+)
+with col_m2:
+booster = model.get_booster()
+raw = booster.save_raw()
+if isinstance(raw, (memoryview, bytearray)):
+raw = bytes(raw)
+buf = io.BytesIO()
+buf.write(bytes(raw))
+buf.seek(0)
+st.download_button(
+"⬇️ Download XGBoost model (binary)",
+data=buf,
+file_name="flight_risk_model.xgb",
+mime="application/octet-stream",
+)
+
+
 st.caption("Tip: Use the sidebar to upload a new file; otherwise the app reads the default CSV from /mnt/data.")
