@@ -9,7 +9,7 @@ import streamlit as st
 
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
@@ -27,20 +27,18 @@ except Exception:
     HAS_XGB = False
 
 warnings.filterwarnings("ignore")
-
-st.set_page_config(page_title="CSV → ML Predictor (Robust)", layout="wide")
+st.set_page_config(page_title="CSV → ML Predictor (Resilient)", layout="wide")
 
 st.title("📈 CSV → Feature Selection → Model Comparison → Best Model → Predictions")
-st.caption("Robust handling for single-class targets, stratified split, and simple undersampling.")
+st.caption("Resilient split: requires both classes only in TRAIN; adds optional oversampling; graceful fallbacks.")
 
 # -----------------------------
 # Utilities
 # -----------------------------
 def _detect_encoding_from_bytes(b: bytes) -> str:
-    sample = b[:4096]
     for enc in ("utf-8", "cp1252", "latin1"):
         try:
-            sample.decode(enc)
+            b[:4096].decode(enc)
             return enc
         except Exception:
             continue
@@ -102,7 +100,6 @@ def build_models(random_state: int = 42) -> Dict[str, Any]:
     return models
 
 def evaluate_model(clf, X_test, y_test, proba_threshold: float = 0.5):
-    # If model ended up single-class, bail gracefully
     try:
         if hasattr(clf, "predict_proba"):
             y_proba = clf.predict_proba(X_test)[:, 1]
@@ -137,18 +134,27 @@ def rank_models(results_df: pd.DataFrame, primary_metric: str = "roc_auc", secon
     df = df.sort_values(by=[primary_metric, secondary_metric], ascending=[False, False])
     return df.index[0] if len(df) else ""
 
-def simple_undersample(X: pd.DataFrame, y: pd.Series, random_state: int = 42):
+def oversample_minority(X: pd.DataFrame, y: pd.Series, min_count: int = 5, random_state: int = 42):
+    """Naive minority oversampling by exact duplication to reach at least `min_count` samples."""
     vc = y.value_counts()
     if len(vc) < 2:
         return X, y
+    minority = vc.idxmin()
     n_min = vc.min()
-    idxs = []
-    for cls, n in vc.items():
-        cls_idx = y[y == cls].index
-        take = min(n_min, len(cls_idx))
-        idxs.append(cls_idx.to_series().sample(n=take, random_state=random_state).index)
-    keep = idxs[0].union_many(idxs[1:]) if hasattr(idxs[0], "union_many") else idxs[0].union(idxs[1])
-    return X.loc[keep], y.loc[keep]
+    if n_min >= min_count:
+        return X, y
+
+    rng = np.random.default_rng(random_state)
+    # Rows of the minority class
+    min_idx = y[y == minority].index
+    need = min_count - n_min
+    if need <= 0:
+        return X, y
+    # Sample with replacement from minority indices
+    rep_idx = rng.choice(min_idx, size=need, replace=True)
+    X_aug = pd.concat([X, X.loc[rep_idx]], axis=0)
+    y_aug = pd.concat([y, y.loc[rep_idx]], axis=0)
+    return X_aug, y_aug
 
 # -----------------------------
 # Sidebar
@@ -159,7 +165,7 @@ with st.sidebar:
     random_state = st.number_input("Random state", value=42, step=1)
     threshold = st.slider("Prediction threshold", 0.05, 0.95, 0.5, 0.05)
     rank_metric = st.selectbox("Primary ranking metric", ["roc_auc", "f1", "accuracy", "precision", "recall"], index=0)
-    do_undersample = st.checkbox("Balance training set by undersampling majority class", value=False)
+    balance_choice = st.selectbox("Balance training set", ["None", "Undersample majority", "Oversample minority"], index=0)
 
 # -----------------------------
 # Main
@@ -177,10 +183,10 @@ with st.expander("Preview data", expanded=False):
 # Target & features
 target_col = st.selectbox("🎯 Target column (binary: 0/1)", options=list(df.columns))
 
-# Try robust mapping to 0/1
-y_raw_numeric = pd.to_numeric(df[target_col], errors="coerce")
-if y_raw_numeric.notna().all():
-    y = y_raw_numeric.fillna(0).astype(int)
+# Map target
+y_num = pd.to_numeric(df[target_col], errors="coerce")
+if y_num.notna().all():
+    y = y_num.fillna(0).astype(int)
 else:
     mapping = {"yes": 1, "y": 1, "true": 1, "t": 1, "left": 1, "terminated": 1, "1": 1,
                "no": 0, "n": 0, "false": 0, "f": 0, "stay": 0, "active": 0, "0": 0}
@@ -189,12 +195,11 @@ else:
 st.write("Target class counts:", y.value_counts(dropna=False).to_dict())
 
 if y.nunique() < 2:
-    st.error("❌ Your target only has one class. Please choose a different target or remap values so both classes (0 and 1) are present.")
+    st.error("❌ Your target only has one class overall. Please choose a different target or remap values so both classes (0 and 1) are present.")
     st.stop()
 
 feature_cols = st.multiselect("🧩 Select feature columns", options=[c for c in df.columns if c != target_col],
                               default=[c for c in df.columns if c != target_col])
-
 if len(feature_cols) == 0:
     st.error("Please select at least one feature.")
     st.stop()
@@ -202,65 +207,109 @@ if len(feature_cols) == 0:
 preprocessor, num_cols, cat_cols = build_preprocessor(df, feature_cols)
 X = df[feature_cols].copy()
 
-# Split with stratification; if it fails, try fallback strategies
-split_ok = False
-err_msg = None
+# Split: try stratify first; if it fails, do a manual split that ensures at least 1 minority in TRAIN
+minority_class = y.value_counts().idxmin()
+minority_idx = y[y == minority_class].index
+majority_idx = y[y != minority_class].index
+
 try:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
-    # Ensure both sets contain both classes
-    if y_train.nunique() == 2 and y_test.nunique() == 2:
-        split_ok = True
-except Exception as e:
-    err_msg = str(e)
+except Exception:
+    # Non-stratified fallback that forces at least one minority sample into TRAIN if possible
+    # Put one minority sample into TEST only if we have >=2; otherwise keep all minority in TRAIN
+    from math import ceil
+    test_n = ceil(len(X) * test_size)
 
-if not split_ok:
-    # Try StratifiedShuffleSplit explicitly
-    try:
-        sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-        for train_idx, test_idx in sss.split(X, y):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        if y_train.nunique() == 2 and y_test.nunique() == 2:
-            split_ok = True
-    except Exception as e:
-        err_msg = str(e)
+    # Start with a random test sample of majority only
+    rng = np.random.default_rng(random_state)
+    test_majority_take = min(test_n, len(majority_idx))
+    test_majority_idx = rng.choice(majority_idx, size=test_majority_take, replace=False)
+    remaining_majority = list(set(majority_idx) - set(test_majority_idx))
 
-if not split_ok:
-    st.error("❌ Could not create a split that contains both classes in train and test.\n"
-             "Tips: reduce test size, enable undersampling, or verify the minority class has enough samples (≥2).")
+    # Decide how many minority go to test
+    if len(minority_idx) >= 2 and test_n - test_majority_take > 0:
+        # put exactly 1 minority into test to keep at least 1 for train
+        test_minority_take = 1
+        test_minority_idx = rng.choice(minority_idx, size=test_minority_take, replace=False)
+        remaining_minority = list(set(minority_idx) - set(test_minority_idx))
+    else:
+        test_minority_idx = np.array([], dtype=int)
+        remaining_minority = list(minority_idx)
+
+    test_idx = np.concatenate([test_majority_idx, test_minority_idx])
+    train_idx = list(set(range(len(X))) - set(test_idx))
+
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+# Ensure TRAIN has both classes; if not, try oversampling minority in TRAIN to 2 and retry
+if y_train.nunique() < 2:
+    # If TRAIN has only one class but overall we have two, move one sample from TEST to TRAIN if possible
+    missing_class = list(set(y.unique()) - set(y_train.unique()))[0]
+    candidate_idx = y_test[y_test == missing_class].index
+    if len(candidate_idx) >= 1:
+        move_idx = candidate_idx[0]
+        # move this index from test to train
+        X_train = pd.concat([X_train, X.loc[[move_idx]]])
+        y_train = pd.concat([y_train, y.loc[[move_idx]]])
+        X_test = X_test.drop(index=move_idx, errors="ignore")
+        y_test = y_test.drop(index=move_idx, errors="ignore")
+
+# If still single-class in TRAIN, last resort: naive oversample TRAIN to create at least 2 of the minority
+if y_train.nunique() < 2:
+    X_train, y_train = oversample_minority(X_train, y_train, min_count=2, random_state=random_state)
+
+if y_train.nunique() < 2:
+    st.error("❌ Could not ensure both classes appear in the TRAIN set. Verify the dataset has at least 2 samples of the minority class or switch targets.")
     st.stop()
 
-# Optional undersampling on training set only
-if do_undersample:
-    X_train, y_train = simple_undersample(X_train, y_train, random_state=random_state)
-    st.write("After undersampling class counts (train):", y_train.value_counts().to_dict())
-    if y_train.nunique() < 2:
-        st.error("❌ After undersampling, only one class remained. Disable undersampling or adjust parameters.")
-        st.stop()
+# Optional balancing on TRAIN
+if balance_choice == "Undersample majority":
+    # Downsample majority to minority count
+    vc = y_train.value_counts()
+    minority = vc.idxmin()
+    n_min = vc.min()
+    take_idx = []
+    for cls in vc.index:
+        cls_idx = y_train[y_train == cls].index
+        if cls == minority:
+            take_idx.append(cls_idx)
+        else:
+            take_idx.append(cls_idx.to_series().sample(n=n_min, random_state=random_state).index)
+    keep = take_idx[0].union_many(take_idx[1:]) if hasattr(take_idx[0], "union_many") else take_idx[0].union(take_idx[1])
+    X_train, y_train = X_train.loc[keep], y_train.loc[keep]
+elif balance_choice == "Oversample minority":
+    X_train, y_train = oversample_minority(X_train, y_train, min_count=5, random_state=random_state)
 
-# Model training & evaluation
+st.write("Train class counts:", y_train.value_counts().to_dict())
+st.write("Test class counts:", y_test.value_counts().to_dict())
+
+# -----------------------------
+# Model selection & training
+# -----------------------------
 st.subheader("🤖 Choose models")
-available = build_models(random_state=random_state)
-selected_names = []
+available = build_models()
+selected = []
 cols = st.columns(4)
 for i, name in enumerate(available.keys()):
     with cols[i % 4]:
         if st.checkbox(name, value=True):
-            selected_names.append(name)
-if not selected_names:
+            selected.append(name)
+if not selected:
     st.error("Select at least one model.")
     st.stop()
 
 results, trained = {}, {}
 with st.spinner("Training models..."):
-    for name in selected_names:
+    for name in selected:
         pipe = Pipeline(steps=[("preprocess", preprocessor), ("model", available[name])])
         try:
             pipe.fit(X_train, y_train)
-            # Guard: if model accidentally trained as single-class, skip
-            if hasattr(pipe.named_steps["model"], "classes_") and len(getattr(pipe.named_steps["model"], "classes_", [])) < 2:
+            # Some models may still train on a single class if preprocessing removed rows; guard it.
+            model_obj = pipe.named_steps["model"]
+            if hasattr(model_obj, "classes_") and len(getattr(model_obj, "classes_", [])) < 2:
                 st.warning(f"⚠️ {name} trained on a single class — skipping metrics.")
                 results[name] = {"accuracy": np.nan, "precision": np.nan, "recall": np.nan, "f1": np.nan, "roc_auc": np.nan}
                 continue
@@ -272,7 +321,7 @@ with st.spinner("Training models..."):
             results[name] = {"accuracy": np.nan, "precision": np.nan, "recall": np.nan, "f1": np.nan, "roc_auc": np.nan}
 
 if not trained:
-    st.error("❌ No models finished training with two classes. Verify your target and split.")
+    st.error("❌ No models finished training with two classes. Verify your target and class counts.")
     st.stop()
 
 results_df = pd.DataFrame(results).T
