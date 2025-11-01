@@ -10,6 +10,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+
+from pandas.api.types import is_numeric_dtype
+
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
@@ -80,8 +83,8 @@ def make_ohe() -> OneHotEncoder:
 
 def build_preprocessor(df: pd.DataFrame, target_col: str, feature_cols: List[str]) -> Tuple[ColumnTransformer, List[str], List[str]]:
     X = df[feature_cols].copy()
-    numeric_cols = [c for c in feature_cols if np.issubdtype(pd.api.types.infer_dtype(X[c], skipna=True), np.number)]
-    categorical_cols = [c for c in feature_cols if c not in numeric_cols]
+    numeric_cols = [c for c in feature_cols if is_numeric_dtype(X[c])]
+categorical_cols = [c for c in feature_cols if c not in numeric_cols]
 
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
